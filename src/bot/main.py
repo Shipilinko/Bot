@@ -11,6 +11,11 @@ from telegram.ext import Application
 from .config import AppConfig, load_config
 from .handlers import BotHandlers
 
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - optional dependency safety
+    load_dotenv = None
+
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     level=os.getenv("BOT_LOG_LEVEL", "INFO"),
@@ -34,6 +39,9 @@ def run_bot(config_path: Path, token: str) -> None:
         application.run_polling()
     except KeyboardInterrupt:
         logger.info("Остановка по запросу пользователя")
+
+if load_dotenv is not None:
+    load_dotenv()
 
 
 def parse_args() -> tuple[Path, str]:

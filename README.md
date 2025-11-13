@@ -17,7 +17,21 @@
    pip install -r requirements.txt
    ```
 
-2. Укажите токен Telegram бота (переменная `TELEGRAM_BOT_TOKEN`) или передайте его через ключ `--token` при запуске.
+2. Получите токен у [@BotFather](https://t.me/BotFather) и сохраните его в файле `.env`:
+
+   ```bash
+   cp .env.example .env
+   # откройте .env в любом редакторе и вставьте токен вместо заглушки
+   ```
+
+   При запуске файл будет автоматически загружен и переменная `TELEGRAM_BOT_TOKEN` окажется в окружении.
+
+   > Альтернатива: можно передать токен напрямую в командной строке через ключ `--token`.
+   >
+   > ```bash
+   > python -m src.bot.main --config config/bot_config.yaml --token "1234567890:ABCDEF"
+   > ```
+
 3. Запустите бота:
 
    ```bash
