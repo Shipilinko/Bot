@@ -1,6 +1,9 @@
 """Инструменты для загрузки и валидации конфигурации бота."""
 from __future__ import annotations
 
+import os
+import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
@@ -17,12 +20,21 @@ class OptionConfig:
 
 
 @dataclass
+class CaptureConfig:
+    """Описание действий при свободном вводе пользователя."""
+
+    kind: str
+    next_node: str | None = None
+
+
+@dataclass
 class NodeConfig:
     """Сценарный узел с текстом и набором вариантов выбора."""
 
     id: str
     text: str
     options: List[OptionConfig] = field(default_factory=list)
+    capture: CaptureConfig | None = None
 
 
 @dataclass
@@ -40,6 +52,7 @@ class BotBehaviourConfig:
 
     name: str
     farewell: str
+    notify_chat_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -50,11 +63,76 @@ class AppConfig:
     script: ScriptConfig
 
 
+_ENV_TOKEN = re.compile(r"^\$\{([A-Z0-9_]+)\}$")
+
+
+def _resolve_env_value(value: object, *, allow_empty: bool = False) -> str:
+    """Поддерживает плейсхолдеры формата ${ENV_VAR}."""
+
+    if not isinstance(value, str):
+        raise TypeError("Ожидалась строка для подстановки переменной окружения")
+    stripped = value.strip()
+    match = _ENV_TOKEN.fullmatch(stripped)
+    if match:
+        env_name = match.group(1)
+        resolved = os.getenv(env_name, "")
+        if not resolved and not allow_empty:
+            warnings.warn(
+                f"Переменная окружения {env_name} не задана. "
+                "Связанные настройки будут пропущены.",
+                stacklevel=2,
+            )
+        return resolved
+    return stripped
+
+
+def _parse_chat_ids(raw: List[object]) -> List[int]:
+    chat_ids: List[int] = []
+    for index, item in enumerate(raw):
+        if isinstance(item, int):
+            chat_ids.append(item)
+            continue
+        if isinstance(item, str):
+            resolved = _resolve_env_value(item)
+            if not resolved:
+                continue
+            try:
+                chat_ids.append(int(resolved))
+            except ValueError as exc:  # pragma: no cover - конфигурационные ошибки
+                raise ValueError(
+                    f"Значение bot.notify_chat_ids[{index}] должно быть числом"
+                ) from exc
+            continue
+        raise ValueError(
+            "Список bot.notify_chat_ids может содержать только числа или строки"
+        )
+    return chat_ids
+
+
+def _parse_capture(raw: dict, node_id: str) -> CaptureConfig:
+    kind = str(raw.get("type") or raw.get("kind") or "").strip()
+    if not kind:
+        raise ValueError(
+            f"Узел '{node_id}' содержит блок capture без типа (capture.type)"
+        )
+    next_raw = raw.get("next") if raw.get("next") is not None else raw.get("next_node")
+    next_node = str(next_raw).strip() if next_raw is not None else ""
+    return CaptureConfig(kind=kind, next_node=next_node or None)
+
+
 def _parse_bot(raw: dict) -> BotBehaviourConfig:
     if "name" not in raw:
         raise ValueError("Не задано имя бота (bot.name)")
     farewell = str(raw.get("farewell", "Буду рад снова помочь!"))
-    return BotBehaviourConfig(name=str(raw["name"]), farewell=farewell)
+    notify_raw = raw.get("notify_chat_ids", []) or []
+    if not isinstance(notify_raw, list):
+        raise ValueError("Параметр bot.notify_chat_ids должен быть списком")
+    notify_chat_ids = _parse_chat_ids(notify_raw)
+    return BotBehaviourConfig(
+        name=str(raw["name"]),
+        farewell=farewell,
+        notify_chat_ids=notify_chat_ids,
+    )
 
 
 def _parse_option(raw: dict, node_id: str, index: int) -> OptionConfig:
@@ -78,7 +156,9 @@ def _parse_node(raw: dict) -> NodeConfig:
     if not text:
         raise ValueError(f"Узел '{node_id}' не содержит текста ответа")
     options = [_parse_option(option, node_id, index) for index, option in enumerate(raw.get("options", []))]
-    return NodeConfig(id=node_id, text=text, options=options)
+    capture_cfg = raw.get("capture")
+    capture = _parse_capture(capture_cfg, node_id) if capture_cfg else None
+    return NodeConfig(id=node_id, text=text, options=options, capture=capture)
 
 
 def _parse_script(raw: dict) -> ScriptConfig:
@@ -101,6 +181,10 @@ def _parse_script(raw: dict) -> ScriptConfig:
                 raise ValueError(
                     f"Узел '{node.id}' содержит переход на отсутствующий узел '{option.next_node}'"
                 )
+        if node.capture and node.capture.next_node and node.capture.next_node not in nodes_by_id:
+            raise ValueError(
+                f"Узел '{node.id}' с capture ссылается на отсутствующий узел '{node.capture.next_node}'"
+            )
     return ScriptConfig(start_node=start_node, fallback_text=fallback_text, nodes=nodes_by_id)
 
 
@@ -121,6 +205,7 @@ def load_config(path: str | Path) -> AppConfig:
 __all__ = [
     "AppConfig",
     "BotBehaviourConfig",
+    "CaptureConfig",
     "NodeConfig",
     "OptionConfig",
     "ScriptConfig",

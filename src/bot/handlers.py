@@ -1,6 +1,7 @@
 """Handlers and routing logic for the Telegram bot."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -9,11 +10,60 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from .config import AppConfig, NodeConfig
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class Reply:
     text: str
     keyboard: ReplyKeyboardMarkup | ReplyKeyboardRemove | None = None
+
+
+RETURN_TO_START_LABEL = "Вернуться в начало"
+
+
+def _parse_lead_submission(message: str) -> dict[str, str]:
+    lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
+    data = {
+        "city": lines[0] if len(lines) > 0 else "",
+        "name": lines[1] if len(lines) > 1 else "",
+        "phone": lines[2] if len(lines) > 2 else "",
+        "interest": " ".join(lines[3:]).strip() if len(lines) > 3 else "",
+    }
+    return data
+
+
+def _build_lead_summary(data: dict[str, str]) -> str:
+    interest = data.get("interest", "").strip()
+    interest_display = interest if interest else "—"
+    return (
+        "Спасибо! 👌\n"
+        "Мы получили вашу заявку:\n\n"
+        f"• Город: {data.get('city') or '—'}\n"
+        f"• ФИО: {data.get('name') or '—'}\n"
+        f"• Телефон: {data.get('phone') or '—'}\n"
+        f"• Интересует: {interest_display}"
+    )
+
+
+def _build_notification_text(update: Update, data: dict[str, str], raw_message: str) -> str:
+    user = update.effective_user
+    chat = update.effective_chat
+    username = f"@{user.username}" if user and user.username else "—"
+    full_name = user.full_name if user else "—"
+    chat_id = chat.id if chat else "—"
+    return (
+        "Новая заявка из Telegram-бота\n"
+        f"Чат: {chat_id}\n"
+        f"Пользователь: {full_name} ({username})\n"
+        f"User ID: {user.id if user else '—'}\n\n"
+        f"Город: {data.get('city') or '—'}\n"
+        f"ФИО: {data.get('name') or '—'}\n"
+        f"Телефон: {data.get('phone') or '—'}\n"
+        f"Интерес: {data.get('interest') or '—'}\n\n"
+        "Сообщение пользователя:\n"
+        f"{raw_message.strip() or '—'}"
+    )
 
 
 def _build_keyboard(buttons: Iterable[str]) -> ReplyKeyboardMarkup | None:
@@ -31,6 +81,12 @@ class ConversationEngine:
     @property
     def start_node_id(self) -> str:
         return self.script.start_node
+
+    def node_for(self, node_id: str) -> NodeConfig:
+        return self.script.nodes.get(node_id, self.script.nodes[self.start_node_id])
+
+    def match_option(self, node: NodeConfig, user_message: str):
+        return self._match_option(node, user_message)
 
     def reply_for_node(self, node: NodeConfig) -> Reply:
         keyboard = _build_keyboard(option.label for option in node.options)
@@ -52,6 +108,12 @@ class ConversationEngine:
     def farewell(self) -> Reply:
         return Reply(text=self.config.bot.farewell, keyboard=ReplyKeyboardRemove())
 
+    def fallback(self, node: NodeConfig) -> Reply:
+        return Reply(
+            text=self.script.fallback_text,
+            keyboard=_build_keyboard(option.label for option in node.options),
+        )
+
     def _match_option(self, node: NodeConfig, user_message: str):
         normalized = (user_message or "").strip().casefold()
         for option in node.options:
@@ -65,6 +127,7 @@ class BotHandlers:
 
     def __init__(self, config: AppConfig) -> None:
         self.engine = ConversationEngine(config)
+        self.notify_chat_ids = config.bot.notify_chat_ids
 
     def register(self, app: Application) -> None:
         app.add_handler(CommandHandler("start", self.start))
@@ -97,16 +160,68 @@ class BotHandlers:
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.message:
             return
+        message_text = update.message.text or ""
         current_node_id = context.user_data.get("node_id", self.engine.start_node_id)
-        next_node_id, reply = self.engine.resolve(current_node_id, update.message.text or "")
-        if next_node_id:
+        node = self.engine.node_for(current_node_id)
+        option = self.engine.match_option(node, message_text)
+        if option:
+            next_node = self.engine.node_for(option.next_node)
+            context.user_data["node_id"] = next_node.id
+            await self._send_reply(update, self.engine.reply_for_node(next_node))
+            return
+        if node.capture and message_text.strip():
+            next_node_id, reply = await self._handle_capture(node, update, context)
             context.user_data["node_id"] = next_node_id
-        await self._send_reply(update, reply)
+            await self._send_reply(update, reply)
+            return
+        await self._send_reply(update, self.engine.fallback(node))
 
     async def _send_reply(self, update: Update, reply: Reply | None) -> None:
         if not reply or not update.effective_chat:
             return
         await update.effective_chat.send_message(reply.text, reply_markup=reply.keyboard)
+
+    async def _handle_capture(
+        self,
+        node: NodeConfig,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> tuple[str, Reply]:
+        if not node.capture:
+            return node.id, self.engine.fallback(node)
+        kind = node.capture.kind
+        if kind != "lead_form":  # pragma: no cover - для будущих расширений
+            logger.warning("Неизвестный тип capture '%s'", kind)
+            return node.id, self.engine.fallback(node)
+        message_text = update.message.text or ""
+        data = _parse_lead_submission(message_text)
+        await self._notify_managers(update, context, data, message_text)
+        summary = _build_lead_summary(data)
+        start_keyboard = self.engine.reply_for_node(
+            self.engine.node_for(self.engine.start_node_id)
+        ).keyboard
+        keyboard = start_keyboard or _build_keyboard([RETURN_TO_START_LABEL])
+        next_node_id = node.capture.next_node or self.engine.start_node_id
+        return next_node_id, Reply(text=summary, keyboard=keyboard)
+
+    async def _notify_managers(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        data: dict[str, str],
+        raw_message: str,
+    ) -> None:
+        if not self.notify_chat_ids:
+            return
+        if not context.application:
+            logger.warning("Приложение Telegram не инициализировано, уведомление не отправлено")
+            return
+        text = _build_notification_text(update, data, raw_message)
+        for chat_id in self.notify_chat_ids:
+            try:
+                await context.application.bot.send_message(chat_id, text)
+            except Exception as exc:  # pragma: no cover - зависит от Telegram API
+                logger.warning("Не удалось отправить уведомление в чат %s: %s", chat_id, exc)
 
 
 __all__ = ["BotHandlers", "ConversationEngine"]
