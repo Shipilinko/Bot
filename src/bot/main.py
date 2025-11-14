@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import logging
 import os
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
+from typing import Iterable, Tuple
 
+import yaml
 from telegram.ext import Application
 
 from .config import AppConfig, load_config
@@ -30,8 +32,7 @@ def build_application(config: AppConfig, token: str) -> Application:
     return app
 
 
-def run_bot(config_path: Path, token: str) -> None:
-    config = load_config(config_path)
+def run_bot(config: AppConfig, token: str) -> None:
     logger.info("Конфигурация загружена. Бот: %s", config.bot.name)
     application = build_application(config, token)
     logger.info("Бот запущен. Ожидаем сообщения...")
@@ -44,7 +45,7 @@ if load_dotenv is not None:
     load_dotenv()
 
 
-def parse_args() -> tuple[Path, str]:
+def parse_args() -> tuple[ArgumentParser, Namespace]:
     parser = ArgumentParser(description="Telegram бот-консультант")
     parser.add_argument(
         "--config",
@@ -57,16 +58,68 @@ def parse_args() -> tuple[Path, str]:
         default=None,
         help="Токен Telegram (по умолчанию переменная окружения TELEGRAM_BOT_TOKEN)",
     )
+    parser.add_argument(
+        "--secrets",
+        default=Path("config/secrets.yaml"),
+        type=Path,
+        help="YAML файл с токеном и ID чатов (по умолчанию config/secrets.yaml).",
+    )
     args = parser.parse_args()
-    token = args.token or os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        parser.error("Укажите токен через --token или TELEGRAM_BOT_TOKEN")
-    return args.config, token
+    return parser, args
+
+
+def _parse_chat_ids(raw: Iterable[object]) -> list[int]:
+    chat_ids: list[int] = []
+    for index, item in enumerate(raw):
+        if isinstance(item, int):
+            chat_ids.append(item)
+            continue
+        if isinstance(item, str):
+            stripped = item.strip()
+            if not stripped:
+                continue
+            try:
+                chat_ids.append(int(stripped))
+            except ValueError as exc:
+                raise ValueError(
+                    f"Значение notify_chat_ids[{index}] в файле secrets должно быть числом"
+                ) from exc
+            continue
+        raise ValueError(
+            "notify_chat_ids в файле secrets может содержать только числа или строки"
+        )
+    return chat_ids
+
+
+def load_secrets(path: Path) -> Tuple[str | None, list[int]]:
+    if not path.exists():
+        return None, []
+    with path.open("r", encoding="utf-8") as fp:
+        data = yaml.safe_load(fp) or {}
+    telegram_section = data.get("telegram") or {}
+    if not isinstance(telegram_section, dict):
+        raise ValueError("Секция telegram в файле secrets должна быть объектом")
+    token_raw = telegram_section.get("token", "")
+    token = str(token_raw).strip() if token_raw is not None else ""
+    notify_raw = telegram_section.get("notify_chat_ids", []) or []
+    if not isinstance(notify_raw, (list, tuple)):
+        raise ValueError("notify_chat_ids в файле secrets должен быть списком")
+    chat_ids = _parse_chat_ids(notify_raw)
+    return token or None, chat_ids
 
 
 def main() -> None:
-    config_path, token = parse_args()
-    run_bot(config_path, token)
+    parser, args = parse_args()
+    secrets_token, secrets_chat_ids = load_secrets(args.secrets)
+    token = args.token or os.getenv("TELEGRAM_BOT_TOKEN") or secrets_token
+    if not token:
+        parser.error(
+            "Укажите токен через --token, TELEGRAM_BOT_TOKEN или config/secrets.yaml"
+        )
+    config = load_config(args.config)
+    if secrets_chat_ids:
+        config.bot.notify_chat_ids = secrets_chat_ids
+    run_bot(config, token)
 
 
 if __name__ == "__main__":

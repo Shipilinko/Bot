@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -21,9 +22,33 @@ class Reply:
 
 RETURN_TO_START_LABEL = "Вернуться в начало"
 
+_LEAD_FIELD_LABELS = {
+    "city": "Город",
+    "name": "ФИО",
+    "phone": "Телефон",
+    "interest": "Что вас интересует",
+}
+
+_LIST_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:[\d]+[\.)\-:]+|[•\-*+–—])\s*",
+    re.UNICODE,
+)
+
+
+def _normalize_lead_line(line: str) -> str:
+    """Remove list-like prefixes (e.g. "1." or "•") from lead form lines."""
+
+    cleaned = (line or "").strip()
+    cleaned = _LIST_PREFIX_PATTERN.sub("", cleaned, count=1)
+    return cleaned.strip()
+
 
 def _parse_lead_submission(message: str) -> dict[str, str]:
-    lines = [line.strip() for line in (message or "").splitlines() if line.strip()]
+    lines = [
+        _normalize_lead_line(line)
+        for line in (message or "").splitlines()
+        if line.strip()
+    ]
     data = {
         "city": lines[0] if len(lines) > 0 else "",
         "name": lines[1] if len(lines) > 1 else "",
@@ -195,6 +220,24 @@ class BotHandlers:
             return node.id, self.engine.fallback(node)
         message_text = update.message.text or ""
         data = _parse_lead_submission(message_text)
+        missing_fields = [
+            _LEAD_FIELD_LABELS[field]
+            for field in ("city", "name", "phone", "interest")
+            if not data.get(field)
+        ]
+        if missing_fields:
+            prompt_lines = [
+                "Кажется, в сообщении не хватает данных:",
+                *[f"• {field}" for field in missing_fields],
+                "",
+                "Пожалуйста, отправьте данные одним сообщением в формате:",
+                "Город",
+                "ФИО",
+                "Номер телефона",
+                "Что вас интересует?",
+            ]
+            keyboard = self.engine.reply_for_node(node).keyboard
+            return node.id, Reply(text="\n".join(prompt_lines).strip(), keyboard=keyboard)
         await self._notify_managers(update, context, data, message_text)
         summary = _build_lead_summary(data)
         start_keyboard = self.engine.reply_for_node(

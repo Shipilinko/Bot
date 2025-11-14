@@ -1,8 +1,7 @@
 bot:
   name: "ClinicGuru"
   farewell: "Буду рад помочь с запуском вашей клиники!"
-  notify_chat_ids:
-    - "${TELEGRAM_MANAGER_CHAT_ID}"
+  notify_chat_ids: []
 
 script:
   start_node: "welcome"
